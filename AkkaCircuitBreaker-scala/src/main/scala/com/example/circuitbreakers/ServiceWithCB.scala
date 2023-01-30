@@ -1,39 +1,53 @@
 package com.example.circuitbreakers
 
-import java.util.concurrent.TimeoutException
-
-import scala.concurrent.Future
-import scala.concurrent.duration._
+import akka.actor.typed.scaladsl.Behaviors
+import akka.actor.typed.{ActorSystem, Behavior}
 import akka.pattern.CircuitBreaker
-import akka.pattern.pipe
-import akka.actor.{Props, Actor, ActorLogging}
-import Service._
 
-object ServiceWithCB {
-  def props: Props =
-    Props(new ServiceWithCB)
-}
+import scala.concurrent.{ExecutionContext, Future, TimeoutException}
+import scala.concurrent.duration.DurationInt
+import scala.util.{Failure, Success}
 
-class ServiceWithCB extends Actor with ActorLogging with Service {
+object ServiceWithCB {}
+class ServiceWithCB(implicit system: ActorSystem[Nothing]) extends Service {
 
-  import context.dispatcher
+  implicit val exectitionContext: ExecutionContext = system.executionContext
+
+  val classicSystem = akka.actor.ActorSystem("ClassicToTypedSystem")
 
   val breaker =
     new CircuitBreaker(
-      context.system.scheduler,
+      scheduler = classicSystem.scheduler,
       maxFailures = 1,
-      callTimeout = 2 seconds,
-      resetTimeout = 10 seconds).
-        onOpen(notifyMe("Open")).
-        onClose(notifyMe("Closed")).
-        onHalfOpen(notifyMe("Half Open"))
+      callTimeout = 2.seconds,
+      resetTimeout = 10.seconds
+    ).onOpen(notifyMe("Open"))
+      .onClose(notifyMe("Closed"))
+      .onHalfOpen(notifyMe("Half Open"))
 
-  private def notifyMe(state: String): Unit =
-    log.warning(s"My CircuitBreaker is now $state")
+  private def notifyMe(state: String): Unit = println(
+    s"My CircuitBreaker is now $state"
+  )
 
-  override def receive: Receive = {
-    case Request =>
-      breaker.withCircuitBreaker(Future(callWebService())) pipeTo sender()
-  }
+  def behavior(): Behavior[Service.Message] =
+    Behaviors.receive { (ctx, message) =>
+      val self = ctx.self
+      message match {
+        case Service.Request(replyTo) =>
+          val response: Future[Service.Response.type] =
+            breaker.withCircuitBreaker(Future(callWebService()))
+          response.onComplete(t => {
+            t match {
+              case Success(s) => replyTo ! s
+              case Failure(_: TimeoutException) =>
+                replyTo ! Service.TimeoutFailure
+              case Failure(exception: Exception) =>
+                // println(s"exception $exception")
+                replyTo ! Service.Failure(exception)
+            }
+          })
+          Behaviors.same
+      }
+    }
 
 }
